@@ -20,7 +20,7 @@ class PacketData:
 
 class CaptureSource(ABC):
     """Abstract base class for network traffic capture sources."""
-    
+
     def __init__(self, buffer_size: int = 1024):
         self.buffer_size = buffer_size
         self._is_running = False
@@ -56,7 +56,7 @@ class CaptureSource(ABC):
 
 class LiveCapture(CaptureSource):
     """Live network interface capture implementation."""
-    
+
     def __init__(self, interface: str, buffer_size: int = 1024):
         super().__init__(buffer_size)
         self.interface = interface
@@ -69,14 +69,14 @@ class LiveCapture(CaptureSource):
         try:
             from scapy.all import sniff
             import os
-            
+
             # Ensure we have root privileges for capture
             if os.geteuid() != 0:
                 raise PermissionError("Root privileges required for network capture")
-                
+
             # Initialize capture before potentially dropping privileges
             super().start()
-            self._capture_handle = sniff(iface=self.interface, store=False, 
+            self._capture_handle = sniff(iface=self.interface, store=False,
                                        prn=self._packet_callback, count=0,
                                        filter="ip")  # Only capture IP packets
         except ImportError:
@@ -96,19 +96,19 @@ class LiveCapture(CaptureSource):
     def _packet_callback(self, packet: Any) -> None:
         """Process captured packet."""
         from scapy.layers.inet import IP, TCP, UDP, ICMP
-        
+
         if IP in packet:
             # Extract basic packet info
             ip_packet = packet[IP]
             size = len(packet)
             timestamp = float(packet.time)
-            
+
             # Determine protocol and ports
             protocol = "UNKNOWN"
             src_port = None
             dst_port = None
             flags = {}
-            
+
             if TCP in packet:
                 protocol = "TCP"
                 tcp = packet[TCP]
@@ -135,7 +135,7 @@ class LiveCapture(CaptureSource):
                     "type": icmp.type,
                     "code": icmp.code
                 }
-            
+
             # Create standardized packet data
             packet_data = PacketData(
                 timestamp=timestamp,
@@ -146,18 +146,23 @@ class LiveCapture(CaptureSource):
                 flags=flags,
                 payload=bytes(packet.payload)
             )
-            
+
             # Store packet in buffer
             with self._buffer_lock:
                 self._packet_buffer.append(packet_data)
 
 class PcapReader(CaptureSource):
     """PCAP file reader implementation."""
-    
-    def __init__(self, filepath: str, buffer_size: int = 1024):
+
+    def __init__(self, filepath: str, buffer_size: int = 1024, loop: bool = False):
         super().__init__(buffer_size)
         self.filepath = filepath
         self._reader = None
+        self._current_index = 0
+        self._packet_count = 0
+        self._loop = loop  # Whether to loop back to the beginning when reaching the end
+        self._packet_buffer: Deque[PacketData] = deque(maxlen=buffer_size)
+        self._buffer_lock = threading.Lock()
 
     def start(self) -> None:
         """Start reading from PCAP file."""
@@ -165,15 +170,99 @@ class PcapReader(CaptureSource):
             from scapy.all import rdpcap
             super().start()
             self._reader = rdpcap(self.filepath)
+            self._packet_count = len(self._reader)
+            self._current_index = 0
+
+            # Pre-process some packets to fill the buffer
+            self._fill_buffer()
+
+            print(f"Loaded PCAP file with {self._packet_count} packets")
         except ImportError:
             raise ImportError("Scapy is required for PCAP reading. Install with: pip install scapy")
+        except Exception as e:
+            raise RuntimeError(f"Error reading PCAP file: {e}")
 
     def stop(self) -> None:
         """Stop reading from PCAP file."""
+        with self._buffer_lock:
+            self._packet_buffer.clear()
         self._reader = None
+        self._current_index = 0
         super().stop()
 
     def get_packet(self) -> Optional[PacketData]:
         """Get next packet from the PCAP file."""
-        # Implementation for reading from PCAP
-        pass
+        with self._buffer_lock:
+            if not self._packet_buffer and self._is_running:
+                self._fill_buffer()
+            return self._packet_buffer.popleft() if self._packet_buffer else None
+
+    def _fill_buffer(self) -> None:
+        """Fill the packet buffer with processed packets."""
+        if not self._reader or not self._is_running:
+            return
+
+        from scapy.layers.inet import IP, TCP, UDP, ICMP
+
+        # Process packets until buffer is full or we reach the end
+        while len(self._packet_buffer) < self.buffer_size and self._current_index < self._packet_count:
+            packet = self._reader[self._current_index]
+            self._current_index += 1
+
+            # Reset to beginning if looping and we've reached the end
+            if self._current_index >= self._packet_count and self._loop:
+                self._current_index = 0
+
+            # Process only IP packets
+            if IP in packet:
+                # Extract basic packet info
+                ip_packet = packet[IP]
+                size = len(packet)
+                timestamp = float(packet.time)
+
+                # Determine protocol and ports
+                protocol = "UNKNOWN"
+                src_port = None
+                dst_port = None
+                flags = {}
+
+                if TCP in packet:
+                    protocol = "TCP"
+                    tcp = packet[TCP]
+                    src_port = tcp.sport
+                    dst_port = tcp.dport
+                    # Extract TCP flags
+                    flags = {
+                        "SYN": (tcp.flags & 0x02) != 0,
+                        "ACK": (tcp.flags & 0x10) != 0,
+                        "FIN": (tcp.flags & 0x01) != 0,
+                        "RST": (tcp.flags & 0x04) != 0,
+                        "PSH": (tcp.flags & 0x08) != 0,
+                        "URG": (tcp.flags & 0x20) != 0
+                    }
+                elif UDP in packet:
+                    protocol = "UDP"
+                    udp = packet[UDP]
+                    src_port = udp.sport
+                    dst_port = udp.dport
+                elif ICMP in packet:
+                    protocol = "ICMP"
+                    icmp = packet[ICMP]
+                    flags = {
+                        "type": icmp.type,
+                        "code": icmp.code
+                    }
+
+                # Create standardized packet data
+                packet_data = PacketData(
+                    timestamp=timestamp,
+                    size=size,
+                    protocol=protocol,
+                    src_port=src_port,
+                    dst_port=dst_port,
+                    flags=flags,
+                    payload=bytes(packet.payload)
+                )
+
+                # Store packet in buffer
+                self._packet_buffer.append(packet_data)
